@@ -1,0 +1,27 @@
+name: Delete Pull Request environment
+
+on:
+  pull_request:
+    types: [closed]
+
+env:
+  PR_NUMBER: ${{ github.event.number }}
+  PROJECT: ${{ github.event.repository.name }}
+  
+jobs:
+  update-gitops-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update GitOps Pull Request environment
+        uses: cedricve/gitops-pullrequest-environment@main
+        with:
+          # Pass through the GitHub PR action (opened, synchronize, closed)
+          # Based on this action, we can determine if we need to create a new environment or update an existing one.
+          action: ${{ github.event.action }}
+          github-token: ${{ secrets.TOKEN }}
+          gitops-repo: "uug-ai/gitops"
+          gitops-project: ${{ env.PROJECT }}
+          gitops-pr-environment: "pr${{ env.PR_NUMBER }}"
+          commit-email: "gitops@uug.ai"
+          commit-name: "GitOps - UUG.AI"
+          commit-message: "Deleting pull request environment for ${{ env.PROJECT }} for pr${{ env.PR_NUMBER }}"
