@@ -78,26 +78,34 @@ func (ps *ProxyStore) UseIn(composer *handler.StoreComposer) {
 
 // NewUpload creates a new upload in both local and remote storage
 func (ps *ProxyStore) NewUpload(ctx context.Context, info handler.FileInfo) (handler.Upload, error) {
+	log.Printf("ProxyStore: [ENTER NewUpload] info.ID=%q (len=%d) info.Size=%d", info.ID, len(info.ID), info.Size)
+
 	// Create upload in local store first
 	upload, err := ps.localStore.NewUpload(ctx, info)
 	if err != nil {
+		log.Printf("ProxyStore: [ERROR NewUpload] local store failed for ID=%q: %v", info.ID, err)
 		return nil, err
 	}
+	log.Printf("ProxyStore: [NewUpload] local upload created for ID=%q", info.ID)
 
 	// Initiate upload on remote storage with retry
+	log.Printf("ProxyStore: [NewUpload] initiating remote upload for ID=%q", info.ID)
 	err = ps.retryOperation(func() error {
 		return ps.remoteStorage.InitiateUpload(ctx, info.ID, info.Size, info.MetaData)
 	})
 
 	if err != nil {
-		log.Printf("Failed to initiate remote upload for %s: %v", info.ID, err)
+		log.Printf("ProxyStore: [WARNING NewUpload] Failed to initiate remote upload for %q: %v", info.ID, err)
 		// Don't fail the upload, we'll retry on write
+	} else {
+		log.Printf("ProxyStore: [NewUpload] remote upload initiated successfully for ID=%q", info.ID)
 	}
 
 	ps.progressLock.Lock()
 	ps.remoteOffsets[info.ID] = 0
 	ps.progressLock.Unlock()
 
+	log.Printf("ProxyStore: [SUCCESS NewUpload] returning proxyUpload with id=%q", info.ID)
 	return &proxyUpload{
 		upload:     upload,
 		proxyStore: ps,
@@ -107,22 +115,48 @@ func (ps *ProxyStore) NewUpload(ctx context.Context, info handler.FileInfo) (han
 
 // GetUpload retrieves an existing upload
 func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload, error) {
+	log.Printf("ProxyStore: [ENTER GetUpload] id=%q (len=%d)", id, len(id))
+
 	upload, err := ps.localStore.GetUpload(ctx, id)
 	if err != nil {
+		log.Printf("ProxyStore: [ERROR GetUpload] local store failed for ID=%q: %v", id, err)
+		return nil, err
+	}
+
+	// Get upload info to check if we need to initiate remote upload
+	info, err := upload.GetInfo(ctx)
+	if err != nil {
+		log.Printf("ProxyStore: [ERROR GetUpload] failed to get upload info for ID=%q: %v", id, err)
 		return nil, err
 	}
 
 	// Try to get remote progress
 	remoteOffset, err := ps.remoteStorage.GetUploadProgress(ctx, id)
 	if err != nil {
-		log.Printf("Failed to get remote progress for %s: %v", id, err)
+		log.Printf("ProxyStore: [GetUpload] failed to get remote progress for %q: %v (will initiate)", id, err)
 		remoteOffset = 0
+
+		// If remote upload doesn't exist, initiate it now
+		// This handles the case where an upload is resumed but remote upload was never initiated
+		log.Printf("ProxyStore: [GetUpload] initiating remote upload for resumed upload %q", id)
+		err = ps.retryOperation(func() error {
+			return ps.remoteStorage.InitiateUpload(ctx, info.ID, info.Size, info.MetaData)
+		})
+		if err != nil {
+			log.Printf("ProxyStore: [WARNING GetUpload] failed to initiate remote upload for %q: %v", id, err)
+			// Don't fail the upload, we'll retry on write
+		} else {
+			log.Printf("ProxyStore: [GetUpload] remote upload initiated successfully for resumed upload %q", id)
+		}
+	} else {
+		log.Printf("ProxyStore: [GetUpload] remote upload exists for %q, offset=%d", id, remoteOffset)
 	}
 
 	ps.progressLock.Lock()
 	ps.remoteOffsets[id] = remoteOffset
 	ps.progressLock.Unlock()
 
+	log.Printf("ProxyStore: [SUCCESS GetUpload] returning proxyUpload with id=%q", id)
 	return &proxyUpload{
 		upload:     upload,
 		proxyStore: ps,
@@ -182,6 +216,8 @@ type proxyUpload struct {
 
 // WriteChunk writes data to local storage first, then sends to remote storage
 func (pu *proxyUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
+	log.Printf("ProxyUpload: [ENTER WriteChunk] id=%q (len=%d) offset=%d", pu.id, len(pu.id), offset)
+
 	// Step 1: Write to local storage first to ensure data is persisted
 	bytesWritten, localErr := pu.upload.WriteChunk(ctx, offset, src)
 	if localErr != nil {
@@ -202,11 +238,16 @@ func (pu *proxyUpload) WriteChunk(ctx context.Context, offset int64, src io.Read
 
 	// Upload to remote storage asynchronously
 	go func() {
+		log.Printf("ProxyUpload: [WriteChunk goroutine] starting remote upload for id=%q offset=%d size=%d", pu.id, offset, bytesWritten)
+
+		// Use a background context for async operations to avoid cancelled context issues
+		asyncCtx := context.Background()
+
 		// Upload to remote storage with retry
 		// For each retry attempt, we re-read the chunk from local storage
 		err := pu.proxyStore.retryOperation(func() error {
 			// Get a fresh reader from local storage for this attempt
-			reader, err := pu.upload.GetReader(ctx)
+			reader, err := pu.upload.GetReader(asyncCtx)
 			if err != nil {
 				return fmt.Errorf("failed to get reader: %w", err)
 			}
@@ -223,7 +264,8 @@ func (pu *proxyUpload) WriteChunk(ctx context.Context, offset int64, src io.Read
 			chunkReader := io.LimitReader(reader, bytesWritten)
 
 			// Send this specific chunk to remote storage
-			return pu.proxyStore.remoteStorage.WriteChunk(ctx, pu.id, offset, chunkReader, bytesWritten)
+			log.Printf("ProxyUpload: [WriteChunk goroutine] calling remoteStorage.WriteChunk with id=%q (len=%d) offset=%d size=%d", pu.id, len(pu.id), offset, bytesWritten)
+			return pu.proxyStore.remoteStorage.WriteChunk(asyncCtx, pu.id, offset, chunkReader, bytesWritten)
 		})
 
 		if err != nil {
