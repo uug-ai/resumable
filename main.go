@@ -2,82 +2,72 @@ package main
 
 import (
 	"log"
+	"net/http"
 
-	"github.com/hashicorp/go-plugin"
-	"github.com/tus/tusd/v2/pkg/hooks"
-	tusdplugin "github.com/tus/tusd/v2/pkg/hooks/plugin"
+	"github.com/tus/tusd/v2/pkg/filelocker"
+	"github.com/tus/tusd/v2/pkg/filestore"
+	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
 
-// Here is the implementation of our hook handler
-type MyHookHandler struct {
-}
-
-// Setup is called once the plugin has been loaded by tusd.
-func (g *MyHookHandler) Setup() error {
-	// Use the log package or the g.logger field to write debug messages.
-	// Do not write to stdout directly, as this is used for communication between
-	// tusd and the plugin.
-	log.Println("MyHookHandler.Setup is invoked")
-	return nil
-}
-
-// InvokeHook is called for every hook that tusd fires.
-func (g *MyHookHandler) InvokeHook(req hooks.HookRequest) (res hooks.HookResponse, err error) {
-	log.Println("MyHookHandler.InvokeHook is invoked")
-
-	// Prepare hook response structure
-	res.HTTPResponse.Header = make(map[string]string)
-
-	// Example: Use the pre-create hook to check if a filename has been supplied
-	// using metadata. If not, the upload is rejected with a custom HTTP response.
-
-	if req.Type == hooks.HookPreCreate {
-		if _, ok := req.Event.Upload.MetaData["filename"]; !ok {
-			res.RejectUpload = true
-			res.HTTPResponse.StatusCode = 400
-			res.HTTPResponse.Body = "no filename provided"
-			res.HTTPResponse.Header["X-Some-Header"] = "yes"
-		}
-	}
-
-	// Example: Use the post-finish hook to print information about a completed upload,
-	// including its storage location.
-	if req.Type == hooks.HookPostFinish {
-		id := req.Event.Upload.ID
-		size := req.Event.Upload.Size
-		storage := req.Event.Upload.Storage
-
-		log.Printf("Upload %s (%d bytes) is finished. Find the file at:\n", id, size)
-		log.Println(storage)
-
-	}
-
-	// Return the hook response to tusd.
-	return res, nil
-}
-
-// handshakeConfigs are used to just do a basic handshake between
-// a plugin and tusd. If the handshake fails, a user friendly error is shown.
-// This prevents users from executing bad plugins or executing a plugin
-// directory. It is a UX feature, not a security feature.
-var handshakeConfig = plugin.HandshakeConfig{
-	ProtocolVersion:  1,
-	MagicCookieKey:   "TUSD_PLUGIN",
-	MagicCookieValue: "yes",
-}
-
 func main() {
-	// 1. Initialize our handler.
-	myHandler := &MyHookHandler{}
+	// Create a new FileStore instance which is responsible for
+	// storing the uploaded file on disk in the specified directory.
+	// This path _must_ exist before tusd will store uploads in it.
+	// If you want to save them on a different medium, for example
+	// a remote FTP server, you can implement your own storage backend
+	// by implementing the tusd.DataStore interface.
+	store := filestore.New("./uploads")
+	/*s3Service := s3store.S3Store{
+		Region:   "us-east-1",
+		Endpoint: "http://localhost:9000",
+		// AccessKeyID:     "your-access-key-id",
+		// SecretAccessKey: "your-secret-access-key",
+	}
+	store := s3store.New("my-bucket", s3Service)*/
 
-	// 2. Construct the plugin map. The key must be "hookHandler".
-	var pluginMap = map[string]plugin.Plugin{
-		"hookHandler": &tusdplugin.HookHandlerPlugin{Impl: myHandler},
+	// A locking mechanism helps preventing data loss or corruption from
+	// parallel requests to a upload resource. A good match for the disk-based
+	// storage is the filelocker package which uses disk-based file lock for
+	// coordinating access.
+	// More information is available at https://tus.github.io/tusd/advanced-topics/locks/.
+	locker := filelocker.New("./uploads")
+
+	// A storage backend for tusd may consist of multiple different parts which
+	// handle upload creation, locking, termination and so on. The composer is a
+	// place where all those separated pieces are joined together. In this example
+	// we only use the file store but you may plug in multiple.
+	composer := tusd.NewStoreComposer()
+	store.UseIn(composer)
+	locker.UseIn(composer)
+
+	// Create a new HTTP handler for the tusd server by providing a configuration.
+	// The StoreComposer property must be set to allow the handler to function.
+	handler, err := tusd.NewHandler(tusd.Config{
+		BasePath:              "/files/",
+		StoreComposer:         composer,
+		NotifyCompleteUploads: true,
+	})
+	if err != nil {
+		log.Fatalf("unable to create handler: %s", err)
 	}
 
-	// 3. Expose the plugin to tusd.
-	plugin.Serve(&plugin.ServeConfig{
-		HandshakeConfig: handshakeConfig,
-		Plugins:         pluginMap,
-	})
+	// Start another goroutine for receiving events from the handler whenever
+	// an upload is completed. The event will contains details about the upload
+	// itself and the relevant HTTP request.
+	go func() {
+		for {
+			event := <-handler.CompleteUploads
+			log.Printf("Upload %s finished\n", event.Upload.ID)
+		}
+	}()
+
+	// Right now, nothing has happened since we need to start the HTTP server on
+	// our own. In the end, tusd will start listening on and accept request at
+	// http://localhost:8080/files
+	http.Handle("/files/", http.StripPrefix("/files/", handler))
+	http.Handle("/files", http.StripPrefix("/files", handler))
+	err = http.ListenAndServe(":8080", nil)
+	if err != nil {
+		log.Fatalf("unable to listen: %s", err)
+	}
 }
