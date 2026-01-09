@@ -7,41 +7,37 @@ import (
 	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
+
+	"github.com/uug-ai/resumable/pkg/storage"
 )
 
 func main() {
-	// Create a new FileStore instance which is responsible for
-	// storing the uploaded file on disk in the specified directory.
-	// This path _must_ exist before tusd will store uploads in it.
-	// If you want to save them on a different medium, for example
-	// a remote FTP server, you can implement your own storage backend
-	// by implementing the tusd.DataStore interface.
-	store := filestore.New("./uploads")
-	/*s3Service := s3store.S3Store{
-		Region:   "us-east-1",
-		Endpoint: "http://localhost:9000",
-		// AccessKeyID:     "your-access-key-id",
-		// SecretAccessKey: "your-secret-access-key",
-	}
-	store := s3store.New("my-bucket", s3Service)*/
+	// Create a local FileStore for temporary storage and resumability
+	// This ensures uploads can be resumed if network fails
+	localStore := filestore.New("./uploads")
 
-	// A locking mechanism helps preventing data loss or corruption from
-	// parallel requests to a upload resource. A good match for the disk-based
-	// storage is the filelocker package which uses disk-based file lock for
-	// coordinating access.
-	// More information is available at https://tus.github.io/tusd/advanced-topics/locks/.
+	// Create remote storage backend (S3, Azure, GCS, etc.)
+	// This is where files will ultimately be stored
+	remoteStorage := storage.NewS3RemoteStorage(
+		"my-bucket",             // bucket name
+		"us-east-1",             // region
+		"http://localhost:9000", // endpoint (for MinIO/localstack)
+		"access-key",            // access key
+		"secret-key",            // secret key
+	)
+
+	// Create ProxyStore that streams to remote storage while receiving
+	proxyStore := storage.NewProxyStore(localStore, remoteStorage)
+
+	// File locker for preventing concurrent writes to same upload
 	locker := filelocker.New("./uploads")
 
-	// A storage backend for tusd may consist of multiple different parts which
-	// handle upload creation, locking, termination and so on. The composer is a
-	// place where all those separated pieces are joined together. In this example
-	// we only use the file store but you may plug in multiple.
+	// Compose the storage backend
 	composer := tusd.NewStoreComposer()
-	store.UseIn(composer)
+	proxyStore.UseIn(composer)
 	locker.UseIn(composer)
 
-	// Create a new HTTP handler for the tusd server by providing a configuration.
-	// The StoreComposer property must be set to allow the handler to function.
+	// Create the tusd handler
 	handler, err := tusd.NewHandler(tusd.Config{
 		BasePath:              "/files/",
 		StoreComposer:         composer,
@@ -51,23 +47,35 @@ func main() {
 		log.Fatalf("unable to create handler: %s", err)
 	}
 
-	// Start another goroutine for receiving events from the handler whenever
-	// an upload is completed. The event will contains details about the upload
-	// itself and the relevant HTTP request.
+	// Listen for completed uploads
 	go func() {
 		for {
 			event := <-handler.CompleteUploads
-			log.Printf("Upload %s finished\n", event.Upload.ID)
+			log.Printf("Upload %s finished", event.Upload.ID)
+			log.Printf("  Size: %d bytes", event.Upload.Size)
+			log.Printf("  Metadata: %v", event.Upload.MetaData)
+			log.Printf("  File is now in remote storage and can be cleaned from local")
+
+			// Optional: Clean up local file after successful remote upload
+			// if err := handler.Composer.Core.AsTerminatableUpload(event.Upload).Terminate(context.Background()); err != nil {
+			//     log.Printf("Failed to cleanup local file: %v", err)
+			// }
 		}
 	}()
 
-	// Right now, nothing has happened since we need to start the HTTP server on
-	// our own. In the end, tusd will start listening on and accept request at
-	// http://localhost:8080/files
+	// Setup HTTP routes
 	http.Handle("/files/", http.StripPrefix("/files/", handler))
 	http.Handle("/files", http.StripPrefix("/files", handler))
-	err = http.ListenAndServe(":8080", nil)
-	if err != nil {
+
+	log.Println("Starting resumable upload server on :8080")
+	log.Println("Features:")
+	log.Println("  - Receives uploads via TUS protocol")
+	log.Println("  - Streams data to remote storage in real-time")
+	log.Println("  - Automatic retry on remote storage failures")
+	log.Println("  - Local storage for resumability")
+	log.Println("Endpoint: http://localhost:8080/files/")
+
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("unable to listen: %s", err)
 	}
 }
