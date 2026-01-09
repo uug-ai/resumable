@@ -30,6 +30,13 @@ type RemoteStorage interface {
 	GetUploadProgress(ctx context.Context, uploadID string) (int64, error)
 }
 
+// chunkSync tracks the sync status of a chunk
+type chunkSync struct {
+	offset int64
+	size   int64
+	done   chan error // nil when successful, error when failed
+}
+
 // ProxyStore wraps a local store and streams data to remote storage
 type ProxyStore struct {
 	localStore    handler.DataStore
@@ -40,6 +47,9 @@ type ProxyStore struct {
 	// Track remote upload progress
 	progressLock  sync.RWMutex
 	remoteOffsets map[string]int64
+
+	// Track pending chunk uploads
+	pendingChunks map[string][]*chunkSync
 }
 
 // NewProxyStore creates a new proxy store that forwards data to remote storage
@@ -50,6 +60,7 @@ func NewProxyStore(localStore handler.DataStore, remoteStorage RemoteStorage) *P
 		retryAttempts: 3,
 		retryDelay:    time.Second * 2,
 		remoteOffsets: make(map[string]int64),
+		pendingChunks: make(map[string][]*chunkSync),
 	}
 }
 
@@ -169,66 +180,71 @@ type proxyUpload struct {
 	id         string
 }
 
-// WriteChunk writes data to both local and remote storage
+// WriteChunk writes data to local storage first, then sends to remote storage
 func (pu *proxyUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
-	// Use a TeeReader to write to both local and remote simultaneously
-	var remoteWriter io.Writer
-	var pipeReader *io.PipeReader
-	var pipeWriter *io.PipeWriter
-
-	// Create a pipe to stream data to remote storage concurrently
-	pipeReader, pipeWriter = io.Pipe()
-	remoteWriter = pipeWriter
-
-	// Channel to receive remote upload result
-	remoteDone := make(chan error, 1)
-
-	// Start remote upload in background
-	go func() {
-		defer pipeReader.Close()
-
-		// Retry remote write
-		err := pu.proxyStore.retryOperation(func() error {
-			// Note: This is a simplified version. In production, you'd need to handle
-			// the case where we need to re-read the data if retry is needed
-			return pu.proxyStore.remoteStorage.WriteChunk(ctx, pu.id, offset, pipeReader, -1)
-		})
-
-		if err != nil {
-			log.Printf("Remote upload failed for %s at offset %d: %v", pu.id, offset, err)
-		} else {
-			// Update remote offset on success
-			pu.proxyStore.progressLock.Lock()
-			if currentOffset := pu.proxyStore.remoteOffsets[pu.id]; offset > currentOffset {
-				pu.proxyStore.remoteOffsets[pu.id] = offset
-			}
-			pu.proxyStore.progressLock.Unlock()
-		}
-
-		remoteDone <- err
-	}()
-
-	// Write to local storage while simultaneously streaming to remote
-	teeReader := io.TeeReader(src, remoteWriter)
-	bytesWritten, localErr := pu.upload.WriteChunk(ctx, offset, teeReader)
-
-	// Close the pipe writer to signal we're done writing
-	pipeWriter.Close()
-
-	// Wait for remote upload to complete
-	remoteErr := <-remoteDone
-
-	// Return local error if it occurred (takes priority)
+	// Step 1: Write to local storage first to ensure data is persisted
+	bytesWritten, localErr := pu.upload.WriteChunk(ctx, offset, src)
 	if localErr != nil {
 		return bytesWritten, localErr
 	}
 
-	// Log remote errors but don't fail the upload
-	// The data is safe in local storage and can be synced later
-	if remoteErr != nil {
-		log.Printf("Warning: Remote storage sync failed for %s, data is in local storage", pu.id)
+	// Step 2: Track this chunk and upload to remote asynchronously
+	chunk := &chunkSync{
+		offset: offset,
+		size:   bytesWritten,
+		done:   make(chan error, 1),
 	}
 
+	// Register the pending chunk
+	pu.proxyStore.progressLock.Lock()
+	pu.proxyStore.pendingChunks[pu.id] = append(pu.proxyStore.pendingChunks[pu.id], chunk)
+	pu.proxyStore.progressLock.Unlock()
+
+	// Upload to remote storage asynchronously
+	go func() {
+		// Upload to remote storage with retry
+		// For each retry attempt, we re-read the chunk from local storage
+		err := pu.proxyStore.retryOperation(func() error {
+			// Get a fresh reader from local storage for this attempt
+			reader, err := pu.upload.GetReader(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get reader: %w", err)
+			}
+			defer reader.Close()
+
+			// Seek to the offset of the chunk we just wrote
+			if seeker, ok := reader.(io.Seeker); ok {
+				if _, err := seeker.Seek(offset, io.SeekStart); err != nil {
+					return fmt.Errorf("failed to seek to offset %d: %w", offset, err)
+				}
+			}
+
+			// Create a limited reader to only read the exact chunk we just wrote
+			chunkReader := io.LimitReader(reader, bytesWritten)
+
+			// Send this specific chunk to remote storage
+			return pu.proxyStore.remoteStorage.WriteChunk(ctx, pu.id, offset, chunkReader, bytesWritten)
+		})
+
+		if err != nil {
+			log.Printf("Remote upload failed for %s at offset %d (size %d): %v", pu.id, offset, bytesWritten, err)
+		} else {
+			// Update remote offset on success
+			pu.proxyStore.progressLock.Lock()
+			newOffset := offset + bytesWritten
+			if currentOffset := pu.proxyStore.remoteOffsets[pu.id]; newOffset > currentOffset {
+				pu.proxyStore.remoteOffsets[pu.id] = newOffset
+			}
+			pu.proxyStore.progressLock.Unlock()
+			log.Printf("Successfully synced chunk to remote for %s: offset %d, size %d", pu.id, offset, bytesWritten)
+		}
+
+		// Signal completion (success or failure)
+		chunk.done <- err
+	}()
+
+	// Return success immediately after local write completes
+	// Remote upload happens asynchronously in background
 	return bytesWritten, nil
 }
 
@@ -239,21 +255,67 @@ func (pu *proxyUpload) FinishUpload(ctx context.Context) error {
 		return err
 	}
 
+	// Wait for all pending chunks to complete and collect failures
+	pu.proxyStore.progressLock.Lock()
+	pendingChunks := pu.proxyStore.pendingChunks[pu.id]
+	pu.proxyStore.progressLock.Unlock()
+
+	log.Printf("Waiting for %d pending chunks to sync for upload %s", len(pendingChunks), pu.id)
+
+	var failedChunks []*chunkSync
+	for _, chunk := range pendingChunks {
+		err := <-chunk.done
+		if err != nil {
+			failedChunks = append(failedChunks, chunk)
+		}
+	}
+
+	// Retry any failed chunks synchronously before finalizing
+	if len(failedChunks) > 0 {
+		log.Printf("Retrying %d failed chunks for upload %s", len(failedChunks), pu.id)
+		for _, chunk := range failedChunks {
+			err := pu.proxyStore.retryOperation(func() error {
+				reader, err := pu.upload.GetReader(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to get reader: %w", err)
+				}
+				defer reader.Close()
+
+				if seeker, ok := reader.(io.Seeker); ok {
+					if _, err := seeker.Seek(chunk.offset, io.SeekStart); err != nil {
+						return fmt.Errorf("failed to seek to offset %d: %w", chunk.offset, err)
+					}
+				}
+
+				chunkReader := io.LimitReader(reader, chunk.size)
+				return pu.proxyStore.remoteStorage.WriteChunk(ctx, pu.id, chunk.offset, chunkReader, chunk.size)
+			})
+
+			if err != nil {
+				return fmt.Errorf("failed to sync chunk at offset %d to remote storage: %w", chunk.offset, err)
+			}
+			log.Printf("Successfully retried chunk at offset %d for upload %s", chunk.offset, pu.id)
+		}
+	}
+
+	log.Printf("All chunks synced for upload %s, finalizing remote upload", pu.id)
+
 	// Finalize remote upload with retry
 	err := pu.proxyStore.retryOperation(func() error {
 		return pu.proxyStore.remoteStorage.FinalizeUpload(ctx, pu.id)
 	})
 
 	if err != nil {
-		log.Printf("Failed to finalize remote upload %s: %v", pu.id, err)
-		// Don't return error - upload is complete locally
-		// You might want to trigger a background sync job here
+		return fmt.Errorf("failed to finalize remote upload: %w", err)
 	}
 
+	// Clean up tracking data
 	pu.proxyStore.progressLock.Lock()
 	delete(pu.proxyStore.remoteOffsets, pu.id)
+	delete(pu.proxyStore.pendingChunks, pu.id)
 	pu.proxyStore.progressLock.Unlock()
 
+	log.Printf("Upload %s completed successfully on both local and remote storage", pu.id)
 	return nil
 }
 
@@ -284,6 +346,7 @@ func (pu *proxyUpload) Terminate(ctx context.Context) error {
 
 	pu.proxyStore.progressLock.Lock()
 	delete(pu.proxyStore.remoteOffsets, pu.id)
+	delete(pu.proxyStore.pendingChunks, pu.id)
 	pu.proxyStore.progressLock.Unlock()
 
 	// Then delete local
