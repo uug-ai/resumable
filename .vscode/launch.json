@@ -5,13 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch Package",
+            "name": "Run Server (main.go)",
             "type": "go",
             "request": "launch",
             "mode": "auto",
-            "program": "${workspaceFolder}",
-            "args": ["serve"],
-            "envFile": "${workspaceFolder}/.env" // Add this line to load the .env file
+            "program": "${workspaceFolder}/main.go",
+            "envFile": "${workspaceFolder}/.env.local"
+        },
+        {
+            "name": "Run Client Upload",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "cwd": "${workspaceFolder}/cmd",
+            "program": "${workspaceFolder}/cmd/client_upload.go",
+            "envFile": "${workspaceFolder}/.env.local"
         }
     ]
 }

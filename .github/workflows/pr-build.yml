@@ -26,8 +26,30 @@ jobs:
           - architecture: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - name: Checkout
+          
+      # Start MinIO server
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address ":9001"
+          
+          # Wait for MinIO to be ready
+          timeout 30 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done'
+          echo "MinIO is ready"
+
+          # Create test bucket
+          docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/test-bucket --ignore-existing"
+          echo "Test bucket created"
+          
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
         uses: actions/checkout@v3
+      # Setup Golang for us in the workflow
       - uses: actions/setup-go@v5
         with:
           go-version: "${{ env.GO_VERSION }}"

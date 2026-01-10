@@ -1,45 +1,42 @@
-# Go Project Template
+# Resumable Upload Server
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/uug-ai/templates-go)](https://goreportcard.com/report/github.com/uug-ai/templates-go)
-[![GoDoc](https://godoc.org/github.com/uug-ai/templates-go?status.svg)](https://godoc.org/github.com/uug-ai/templates-go)
-[![Release](https://img.shields.io/github/release/uug-ai/templates-go.svg)](https://github.com/uug-ai/templates-go/releases/latest)
+[![Go Report Card](https://goreportcard.com/badge/github.com/uug-ai/resumable)](https://goreportcard.com/report/github.com/uug-ai/resumable)
+[![GoDoc](https://godoc.org/github.com/uug-ai/resumable?status.svg)](https://godoc.org/github.com/uug-ai/resumable)
+[![Release](https://img.shields.io/github/release/uug-ai/resumable.svg)](https://github.com/uug-ai/resumable/releases/latest)
 
-A production-ready Go project template with best practices, standardized structure, and modern development tooling.
+A production-ready Go server for resumable file uploads with automatic streaming to remote storage (S3, Azure, GCS). Built on the [TUS protocol](https://tus.io/) for reliable, resumable uploads that can survive network interruptions.
 
 ## 🚀 Features
 
-- **Modern Go Structure**: Follows the [Standard Go Project Layout](https://github.com/golang-standards/project-layout)
-- **Docker Support**: Multi-stage Dockerfile for optimized production builds
-- **Dev Container**: Pre-configured development environment with VS Code integration
-- **CI/CD Ready**: GitHub Actions workflows and conventional commit guidelines
-- **Extensible Architecture**: Pre-structured packages for common requirements:
-  - Database connectivity (`pkg/database/`)
-  - Message queue integration (`pkg/queue/`)
-  - HTTP routing and middleware (`internal/router/`)
-  - Audit logging and tracing (`internal/`)
+- **Resumable Uploads**: Built on TUS protocol - uploads automatically resume after network failures
+- **Real-time Streaming**: Data streams directly to remote storage (S3, Azure, GCS) as it's received
+- **Local Caching**: Maintains local copies for resumability and fast recovery
+- **Automatic Retry**: Built-in retry logic for transient remote storage failures
+- **Production Ready**: Docker support, dev container, and structured error handling
+- **Multiple Storage Backends**: Easily extensible to support various cloud storage providers
 
 ## 📁 Project Structure
 
 ```
 .
-├── cmd/                    # Main applications for this project
-├── internal/               # Private application and library code
-│   ├── audit.go           # Audit logging functionality
-│   ├── tracing.go         # Distributed tracing support
-│   └── router/            # HTTP server and middleware
-│       ├── server.go
-│       └── middleware.go
-├── pkg/                    # Public library code (safe to import)
-│   ├── database/          # Database clients and connections
-│   │   └── mongodb.go
-│   └── queue/             # Message queue integrations
-│       └── rabbitmq.go
-├── example/               # Example applications and documentation
+├── cmd/
+│   └── client_upload.go   # Example TUS client for testing uploads
+├── internal/
+│   ├── handler/           # Upload event handlers
+│   └── router/            # HTTP routing and middleware
+├── pkg/
+│   └── storage/           # Storage backends
+│       ├── proxy_store.go # Streaming proxy to remote storage
+│       ├── s3.go          # AWS S3 storage implementation
+│       ├── s3_mock.go     # S3 mock for testing
+│       └── s3_test.go     # Storage tests
+├── uploads/               # Local file storage (for resumability)
+├── examples/              # Example configurations and usage
+├── docs/                  # Documentation
 ├── .devcontainer/         # VS Code dev container configuration
-├── .github/               # GitHub workflows and templates
 ├── Dockerfile             # Multi-stage production build
 ├── go.mod                 # Go module definition
-└── main.go                # Application entry point
+└── main.go                # Server entry point
 ```
 
 ## 🛠️ Getting Started
@@ -47,18 +44,25 @@ A production-ready Go project template with best practices, standardized structu
 ### Prerequisites
 
 - Go 1.24+ (or use the provided dev container)
+- AWS S3 bucket or compatible storage (MinIO, LocalStack, etc.)
 - Docker (optional, for containerized development)
 
-### Using This Template
+### Quick Start
 
-1. **Create a new repository from this template**:
-   - Click "Use this template" on GitHub
-   - Or clone directly: `git clone https://github.com/uug-ai/templates-go.git your-project`
-
-2. **Update module name**:
+1. **Clone the repository**:
    ```bash
-   # Replace the module path in go.mod
-   go mod edit -module github.com/yourusername/yourproject
+   git clone https://github.com/uug-ai/resumable.git
+   cd resumable
+   ```
+
+2. **Set environment variables**:
+   ```bash
+   export AWS_S3_BUCKET=your-bucket-name
+   export AWS_S3_REGION=us-east-1
+   export AWS_ACCESS_KEY_ID=your-access-key
+   export AWS_SECRET_ACCESS_KEY=your-secret-key
+   # Optional: for S3-compatible services (MinIO, etc.)
+   export AWS_S3_ENDPOINT=https://your-endpoint.com
    ```
 
 3. **Install dependencies**:
@@ -66,19 +70,108 @@ A production-ready Go project template with best practices, standardized structu
    go mod download
    ```
 
-4. **Run the application**:
+4. **Run the server**:
    ```bash
    go run main.go
    ```
 
+   The server will start on `http://localhost:8080/files/`
+
+5. **Test with the example client**:
+   ```bash
+   # In another terminal
+   go run cmd/client_upload.go
+   ```
+
 ### Development with Dev Container
 
-This template includes a complete dev container configuration:
+This project includes a complete dev container configuration:
 
 1. Open the project in VS Code
 2. Install the "Dev Containers" extension
 3. Click "Reopen in Container" when prompted
-4. All tools and dependencies are automatically configured
+4. All tools (Go, Git, AWS CLI) are automatically configured
+
+## 🔧 Configuration
+
+### Environment Variables
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `AWS_S3_BUCKET` | Yes | S3 bucket name | - |
+| `AWS_ACCESS_KEY_ID` | Yes | AWS access key | - |
+| `AWS_SECRET_ACCESS_KEY` | Yes | AWS secret key | - |
+| `AWS_S3_REGION` | No | AWS region | `us-east-1` |
+| `AWS_S3_ENDPOINT` | No | Custom S3 endpoint (for MinIO, etc.) | AWS default |
+
+### Storage Configuration
+
+The server uses a two-tier storage approach:
+
+1. **Local Storage** (`./uploads/`): Stores files locally for resumability
+2. **Remote Storage** (S3): Streams data to remote storage in real-time
+
+You can configure:
+- Upload directory location
+- Retry attempts and delays
+- Storage backend (S3, Azure, GCS - extensible)
+
+## 📡 API Usage
+
+### Upload a File with TUS
+
+The server implements the full [TUS protocol](https://tus.io/protocols/resumable-upload). Any TUS client can be used.
+
+**Using cURL:**
+
+```bash
+# Create upload
+curl -X POST http://localhost:8080/files/ \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: 1000000" \
+  -H "Upload-Metadata: filename dmlkZW8ubXA0,filetype dmlkZW8vbXA0"
+
+# Upload data (returns Location header with upload URL)
+curl -X PATCH http://localhost:8080/files/{upload-id} \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Offset: 0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @video.mp4
+```
+
+**Using the included Go client:**
+
+```go
+package main
+
+import (
+    "github.com/bdragon300/tusgo"
+    "net/http"
+    "net/url"
+)
+
+func main() {
+    baseURL, _ := url.Parse("http://localhost:8080/files/")
+    client := tusgo.NewClient(http.DefaultClient, baseURL)
+    
+    // Upload file
+    upload := tusgo.Upload{}
+    upload, err := client.CreateUpload(context.Background(), file, metadata, false)
+    // ... handle upload
+}
+```
+
+See [cmd/client_upload.go](cmd/client_upload.go) for a complete example.
+
+## 🔍 How It Works
+
+1. **Client initiates upload**: TUS client creates an upload with file metadata
+2. **Local storage**: Server creates local file in `./uploads/` for resumability
+3. **Remote streaming**: As chunks arrive, they're immediately streamed to S3
+4. **Progress tracking**: Server tracks both local and remote upload progress
+5. **Automatic retry**: If remote upload fails, chunks are retried automatically
+6. **Resume capability**: If connection drops, client can resume from last successful offset
+7. **Completion**: When upload completes, server notifies and optionally cleans local file
 
 ## 🏗️ Building
 
@@ -86,52 +179,28 @@ This template includes a complete dev container configuration:
 
 ```bash
 # Build for your current platform
-go build -o app main.go
+go build -o resumable-server main.go
 
 # Build with optimizations
-go build -ldflags="-s -w" -o app main.go
+go build -ldflags="-s -w" -o resumable-server main.go
+
+# Run the built binary
+./resumable-server
 ```
 
 ### Docker Build
 
 ```bash
 # Build the Docker image
-docker build \
-  --build-arg project=myapp \
-  --build-arg github_username=your-username \
-  --build-arg github_token=your-token \
-  -t myapp:latest .
+docker build -t resumable-server:latest .
 
-# Run the container
-docker run -p 8080:8080 myapp:latest
-```
-
-## 📦 Package Overview
-
-### `internal/`
-
-Private application code that should not be imported by other projects:
-
-- **`audit.go`**: Audit logging and compliance tracking
-- **`tracing.go`**: OpenTelemetry or similar tracing integration
-- **`router/`**: HTTP server setup and middleware stack
-
-### `pkg/`
-
-Public packages that can be imported by external projects:
-
-- **`database/`**: Database connection management (MongoDB, PostgreSQL, etc.)
-- **`queue/`**: Message queue clients (RabbitMQ, Kafka, etc.)
-
-### `cmd/`
-
-Entry points for different applications (CLIs, services, workers):
-
-```
-cmd/
-├── server/      # Main HTTP server
-├── worker/      # Background job processor
-└── migrate/     # Database migration tool
+# Run the container with environment variables
+docker run -p 8080:8080 \
+  -e AWS_S3_BUCKET=your-bucket \
+  -e AWS_ACCESS_KEY_ID=your-key \
+  -e AWS_SECRET_ACCESS_KEY=your-secret \
+  -v $(pwd)/uploads:/app/uploads \
+  resumable-server:latest
 ```
 
 ## 🧪 Testing
@@ -145,33 +214,57 @@ go test -cover ./...
 
 # Run tests with verbose output
 go test -v ./...
+
+# Test specific package
+go test ./pkg/storage/...
 ```
 
-## 🔧 Configuration
+## 🔌 Extending Storage Backends
 
-The template supports environment-based configuration:
+The server is designed to support multiple storage backends. To add a new backend:
 
-1. Copy `.env` to `.env.local`:
-   ```bash
-   cp .env .env.local
-   ```
+1. Implement the `RemoteStorage` interface in `pkg/storage/`:
 
-2. Update `.env.local` with your local settings (this file is gitignored)
+```go
+type RemoteStorage interface {
+    InitiateUpload(ctx context.Context, uploadID string, size int64, metadata map[string]string) error
+    WriteChunk(ctx context.Context, uploadID string, offset int64, data io.Reader, size int64) error
+    FinalizeUpload(ctx context.Context, uploadID string) error
+    AbortUpload(ctx context.Context, uploadID string) error
+    GetUploadProgress(ctx context.Context, uploadID string) (int64, error)
+}
+```
 
-3. Common environment variables:
-   ```bash
-   # Application
-   APP_NAME=myapp
-   APP_ENV=development
-   PORT=8080
-   
-   # Database
-   MONGODB_URI=mongodb://localhost:27017
-   DATABASE_NAME=myapp
-   
-   # Message Queue
-   RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-   ```
+2. Create your storage implementation (e.g., `pkg/storage/azure.go`)
+3. Update `main.go` to use your new backend
+
+Examples:
+- [pkg/storage/s3.go](pkg/storage/s3.go) - AWS S3 implementation
+- [pkg/storage/s3_mock.go](pkg/storage/s3_mock.go) - Mock for testing
+
+## 📦 Package Overview
+
+### `pkg/storage/`
+
+Storage backend implementations and interfaces:
+
+- **`proxy_store.go`**: Core streaming proxy that manages local+remote storage
+- **`s3.go`**: AWS S3 storage implementation with multipart uploads
+- **`s3_mock.go`**: Mock storage for testing
+- **`s3_test.go`**: Storage backend tests
+
+### `internal/`
+
+Private application code:
+
+- **`handler/`**: Upload event handlers and processing
+- **`router/`**: HTTP server setup and middleware
+
+### `cmd/`
+
+Command-line tools and utilities:
+
+- **`client_upload.go`**: Example TUS client for testing uploads
 
 ## 📝 Commit Guidelines
 
@@ -204,24 +297,45 @@ See [.github/copilot-instructions.md](.github/copilot-instructions.md) for detai
 4. Push to the branch: `git push origin feat/amazing-feature`
 5. Open a Pull Request
 
-## 📄 License
+## � Resources
 
-This template is available as open source. Modify and use it for your projects.
-
-## 🔗 Resources
-
+- [TUS Protocol Documentation](https://tus.io/protocols/resumable-upload)
+- [tusd - TUS Server Reference Implementation](https://github.com/tus/tusd)
 - [Go Documentation](https://go.dev/doc/)
-- [Standard Go Project Layout](https://github.com/golang-standards/project-layout)
-- [Effective Go](https://go.dev/doc/effective_go)
+- [AWS S3 Go SDK](https://docs.aws.amazon.com/sdk-for-go/)
 - [Conventional Commits](https://www.conventionalcommits.org/)
 
-## 💡 Tips
+## 🎯 Use Cases
 
-- Keep `internal/` for code specific to your application
-- Put reusable libraries in `pkg/` if you plan to share them
-- Use `cmd/` for multiple binaries (services, CLI tools, etc.)
-- Leverage the dev container for consistent development environments
-- Follow the commit conventions for better changelog generation
+- **Video Upload Platforms**: Large video file uploads with resume capability
+- **Media Asset Management**: Reliable uploads for media production workflows
+- **Backup Systems**: Resumable backup uploads to cloud storage
+- **File Sharing Services**: User file uploads with automatic cloud sync
+- **Content Delivery**: Upload and distribute large files reliably
+
+## 🐛 Troubleshooting
+
+### Upload fails immediately
+
+- Verify AWS credentials are correct
+- Check S3 bucket exists and you have write permissions
+- Ensure bucket region matches `AWS_S3_REGION`
+
+### Upload succeeds locally but not to S3
+
+- Check S3 endpoint connectivity
+- Verify IAM permissions for multipart uploads
+- Review server logs for detailed error messages
+
+### Uploads are slow
+
+- Check network bandwidth to S3
+- Consider using S3 Transfer Acceleration
+- Adjust chunk size if needed (default is optimized for most cases)
+
+## 📄 License
+
+This project is available as open source under the MIT License.
 
 ---
 
