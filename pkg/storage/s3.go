@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,11 +28,18 @@ type S3Storage struct {
 }
 
 type s3UploadInfo struct {
-	uploadID string
-	key      string // S3 object key
-	parts    []types.CompletedPart
-	partNum  int
+	uploadID  string
+	key       string // S3 object key
+	parts     []types.CompletedPart
+	partNum   int
+	buffer    *bytes.Buffer // Buffer for accumulating data until min part size
+	totalSize int64         // Total expected size of upload
 }
+
+const (
+	// MinPartSize is the minimum size for S3 multipart upload parts (except the last part)
+	MinPartSize = 5 * 1024 * 1024 // 5 MB
+)
 
 // NewS3Storage creates a new S3 remote storage
 func NewS3Storage(bucket, region, endpoint, accessKey, secretKey string) (*S3Storage, error) {
@@ -72,16 +80,25 @@ func NewS3Storage(bucket, region, endpoint, accessKey, secretKey string) (*S3Sto
 	log.Printf("S3: [NewS3Storage] bucket validation successful")
 
 	log.Printf("S3: [NewS3Storage] created new instance, initial mapSize=%d", len(store.uploads))
+
+	// Restore in-progress uploads from S3 to allow resuming after restart
+	log.Printf("S3: [NewS3Storage] restoring in-progress uploads")
+	if err := store.RestoreInProgressUploads(ctx); err != nil {
+		log.Printf("S3: [WARN NewS3Storage] failed to restore in-progress uploads: %v", err)
+		// Don't fail initialization if restore fails, just log the warning
+	}
+
 	return store, nil
 }
 
 func (s *S3Storage) InitiateUpload(ctx context.Context, uploadID string, size int64, metadata map[string]string) error {
 	log.Printf("S3: [ENTER InitiateUpload] uploadID=%s size=%d metadata=%v", uploadID, size, metadata)
 
-	// Determine the S3 key - use filename from metadata if available, otherwise use uploadID
+	// Determine the S3 key - prefix with uploadID for restoration, use filename if available
 	key := uploadID
 	if filename, ok := metadata["filename"]; ok && filename != "" {
-		key = filename
+		// Format: {uploadID}/{filename} - this allows us to extract uploadID during restoration
+		key = uploadID + "/" + filename
 	}
 
 	log.Printf("S3: [InitiateUpload] uploadID=%s resolved key=%s", uploadID, key)
@@ -92,8 +109,15 @@ func (s *S3Storage) InitiateUpload(ctx context.Context, uploadID string, size in
 		return fmt.Errorf("cannot initiate upload: S3 key is empty (uploadID=%s)", uploadID)
 	}
 
-	// Create multipart upload
+	// Create multipart upload with TUS uploadID in metadata
 	log.Printf("S3: [InitiateUpload] uploadID=%s calling CreateMultipartUpload", uploadID)
+
+	// Add TUS uploadID to metadata so we can restore it later
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	metadata["tus-upload-id"] = uploadID
+
 	result, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:   aws.String(s.bucket),
 		Key:      aws.String(key),
@@ -108,10 +132,12 @@ func (s *S3Storage) InitiateUpload(ctx context.Context, uploadID string, size in
 	s.uploadsLock.Lock()
 	log.Printf("S3: [InitiateUpload] storing with key=%q (len=%d)", uploadID, len(uploadID))
 	s.uploads[uploadID] = &s3UploadInfo{
-		uploadID: *result.UploadId,
-		key:      key,
-		parts:    make([]types.CompletedPart, 0),
-		partNum:  1,
+		uploadID:  *result.UploadId,
+		key:       key,
+		parts:     make([]types.CompletedPart, 0),
+		partNum:   1,
+		buffer:    new(bytes.Buffer),
+		totalSize: size,
 	}
 	log.Printf("S3: [InitiateUpload] uploadID=%q stored in map, s3UploadID=%s, mapSize=%d", uploadID, *result.UploadId, len(s.uploads))
 
@@ -154,51 +180,75 @@ func (s *S3Storage) WriteChunk(ctx context.Context, uploadID string, offset int6
 		log.Printf("S3: [ERROR WriteChunk] uploadID=%s NOT FOUND in map, knownUploads=%v, mapSize=%d", uploadID, knownIDs, len(s.uploads))
 		return fmt.Errorf("upload %s not found", uploadID)
 	}
-	partNumber := int32(info.partNum)
-	info.partNum++
-	key := info.key
-	s3UploadID := info.uploadID
-	log.Printf("S3: [WriteChunk] uploadID=%s found in map, s3UploadID=%s key=%s partNumber=%d", uploadID, s3UploadID, key, partNumber)
 	s.uploadsLock.Unlock()
-	log.Printf("S3: [WriteChunk] uploadID=%s lock released", uploadID)
 
-	// Read all data into buffer (required for S3 SDK)
-	log.Printf("S3: [WriteChunk] uploadID=%s reading chunk data into buffer", uploadID)
-	buf := new(bytes.Buffer)
-	written, err := io.Copy(buf, data)
+	// Read chunk data into a temporary buffer
+	log.Printf("S3: [WriteChunk] uploadID=%s reading chunk data", uploadID)
+	chunkData, err := io.ReadAll(data)
 	if err != nil {
 		log.Printf("S3: [ERROR WriteChunk] uploadID=%s failed to read chunk data: %v", uploadID, err)
 		return fmt.Errorf("failed to read chunk data: %w", err)
 	}
-	log.Printf("S3: [WriteChunk] uploadID=%s read %d bytes into buffer", uploadID, written)
+	log.Printf("S3: [WriteChunk] uploadID=%s read %d bytes", uploadID, len(chunkData))
+
+	// Write to buffer and flush if needed
+	s.uploadsLock.Lock()
+	defer s.uploadsLock.Unlock()
+
+	// Write chunk data to buffer
+	info.buffer.Write(chunkData)
+	bufferSize := int64(info.buffer.Len())
+	log.Printf("S3: [WriteChunk] uploadID=%s buffer now contains %d bytes", uploadID, bufferSize)
+
+	// Determine if this is potentially the last chunk
+	// We flush if: buffer >= MinPartSize OR (buffer has data AND we're at the total size)
+	currentOffset := offset + int64(len(chunkData))
+	isLastChunk := info.totalSize > 0 && currentOffset >= info.totalSize
+	shouldFlush := bufferSize >= MinPartSize || (isLastChunk && bufferSize > 0)
+
+	log.Printf("S3: [WriteChunk] uploadID=%s currentOffset=%d totalSize=%d isLastChunk=%v shouldFlush=%v",
+		uploadID, currentOffset, info.totalSize, isLastChunk, shouldFlush)
+
+	if !shouldFlush {
+		log.Printf("S3: [WriteChunk] uploadID=%s buffering data, not flushing yet", uploadID)
+		return nil
+	}
+
+	// Flush buffer to S3 as a new part
+	partNumber := int32(info.partNum)
+	info.partNum++
+	key := info.key
+	s3UploadID := info.uploadID
+	bufferData := info.buffer.Bytes()
+	info.buffer.Reset() // Clear buffer after reading
+
+	log.Printf("S3: [WriteChunk] uploadID=%s uploading part %d with %d bytes", uploadID, partNumber, len(bufferData))
 
 	// Upload part to S3
-	log.Printf("S3: [WriteChunk] uploadID=%s calling UploadPart s3UploadID=%s partNumber=%d", uploadID, s3UploadID, partNumber)
 	result, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     aws.String(s.bucket),
 		Key:        aws.String(key),
 		PartNumber: aws.Int32(partNumber),
 		UploadId:   aws.String(s3UploadID),
-		Body:       bytes.NewReader(buf.Bytes()),
+		Body:       bytes.NewReader(bufferData),
 	})
 	if err != nil {
 		log.Printf("S3: [ERROR WriteChunk] uploadID=%s UploadPart failed for part %d: %v", uploadID, partNumber, err)
+		// Restore data to buffer on failure so it can be retried
+		info.buffer.Write(bufferData)
+		info.partNum-- // Rollback part number
 		return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 	}
 	log.Printf("S3: [WriteChunk] uploadID=%s UploadPart succeeded, ETag=%s", uploadID, *result.ETag)
 
 	// Store completed part info
-	log.Printf("S3: [WriteChunk] uploadID=%s acquiring lock to store completed part", uploadID)
-	s.uploadsLock.Lock()
 	info.parts = append(info.parts, types.CompletedPart{
 		ETag:       result.ETag,
 		PartNumber: aws.Int32(partNumber),
 	})
 	log.Printf("S3: [WriteChunk] uploadID=%s stored part %d, totalParts=%d", uploadID, partNumber, len(info.parts))
-	s.uploadsLock.Unlock()
-	log.Printf("S3: [WriteChunk] uploadID=%s lock released", uploadID)
 
-	log.Printf("S3: [SUCCESS WriteChunk] uploadID=%s part=%d bytes=%d", uploadID, partNumber, written)
+	log.Printf("S3: [SUCCESS WriteChunk] uploadID=%s part=%d bytes=%d", uploadID, partNumber, len(bufferData))
 	return nil
 }
 
@@ -230,7 +280,41 @@ func (s *S3Storage) FinalizeUpload(ctx context.Context, uploadID string) error {
 		return fmt.Errorf("upload %s not found", uploadID)
 	}
 
-	log.Printf("S3: [FinalizeUpload] uploadID=%s found in map, s3UploadID=%s key=%s totalParts=%d", uploadID, info.uploadID, info.key, len(info.parts))
+	log.Printf("S3: [FinalizeUpload] uploadID=%s found in map, s3UploadID=%s key=%s totalParts=%d bufferSize=%d",
+		uploadID, info.uploadID, info.key, len(info.parts), info.buffer.Len())
+
+	// Flush any remaining buffered data as the final part
+	if info.buffer.Len() > 0 {
+		log.Printf("S3: [FinalizeUpload] uploadID=%s flushing final %d bytes from buffer", uploadID, info.buffer.Len())
+		partNumber := int32(info.partNum)
+		info.partNum++
+		key := info.key
+		s3UploadID := info.uploadID
+		bufferData := info.buffer.Bytes()
+		info.buffer.Reset()
+
+		// Upload final part to S3
+		result, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:     aws.String(s.bucket),
+			Key:        aws.String(key),
+			PartNumber: aws.Int32(partNumber),
+			UploadId:   aws.String(s3UploadID),
+			Body:       bytes.NewReader(bufferData),
+		})
+		if err != nil {
+			s.uploadsLock.Unlock()
+			log.Printf("S3: [ERROR FinalizeUpload] uploadID=%s failed to upload final part: %v", uploadID, err)
+			return fmt.Errorf("failed to upload final part: %w", err)
+		}
+		log.Printf("S3: [FinalizeUpload] uploadID=%s uploaded final part %d with %d bytes, ETag=%s",
+			uploadID, partNumber, len(bufferData), *result.ETag)
+
+		// Store completed part info
+		info.parts = append(info.parts, types.CompletedPart{
+			ETag:       result.ETag,
+			PartNumber: aws.Int32(partNumber),
+		})
+	}
 
 	// Sort parts by part number (required by S3)
 	sort.Slice(info.parts, func(i, j int) bool {
@@ -348,4 +432,86 @@ func (s *S3Storage) GetUploadProgress(ctx context.Context, uploadID string) (int
 
 	log.Printf("S3: [SUCCESS GetUploadProgress] uploadID=%s totalSize=%d", uploadID, totalSize)
 	return totalSize, nil
+}
+
+// RestoreInProgressUploads queries S3 for in-progress multipart uploads and restores them to memory
+// This allows the server to resume uploads after a restart
+func (s *S3Storage) RestoreInProgressUploads(ctx context.Context) error {
+	log.Printf("S3: [ENTER RestoreInProgressUploads] querying S3 for in-progress uploads")
+
+	// List all in-progress multipart uploads
+	result, err := s.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(s.bucket),
+	})
+	if err != nil {
+		log.Printf("S3: [ERROR RestoreInProgressUploads] ListMultipartUploads failed: %v", err)
+		return fmt.Errorf("failed to list multipart uploads: %w", err)
+	}
+
+	log.Printf("S3: [RestoreInProgressUploads] found %d in-progress uploads", len(result.Uploads))
+
+	s.uploadsLock.Lock()
+	defer s.uploadsLock.Unlock()
+
+	// Restore each upload to the in-memory map
+	for _, upload := range result.Uploads {
+		if upload.Key == nil || upload.UploadId == nil {
+			continue
+		}
+
+		key := *upload.Key
+		s3UploadID := *upload.UploadId
+
+		log.Printf("S3: [RestoreInProgressUploads] restoring upload: key=%s s3UploadID=%s", key, s3UploadID)
+
+		// Extract TUS uploadID from the S3 key
+		// Key format is: {uploadID} or {uploadID}/{filename}
+		uploadID := key
+		if idx := strings.IndexByte(key, '/'); idx != -1 {
+			uploadID = key[:idx]
+			log.Printf("S3: [RestoreInProgressUploads] extracted uploadID=%s from key=%s", uploadID, key)
+		} else {
+			log.Printf("S3: [RestoreInProgressUploads] using key as uploadID: %s", uploadID)
+		}
+
+		// List existing parts to restore part number tracking
+		partsResult, err := s.client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(key),
+			UploadId: aws.String(s3UploadID),
+		})
+		if err != nil {
+			log.Printf("S3: [WARN RestoreInProgressUploads] failed to list parts for key=%s: %v", key, err)
+			continue
+		}
+
+		// Convert parts to completed parts
+		completedParts := make([]types.CompletedPart, 0, len(partsResult.Parts))
+		maxPartNum := int32(0)
+		for _, part := range partsResult.Parts {
+			if part.ETag != nil && part.PartNumber != nil {
+				completedParts = append(completedParts, types.CompletedPart{
+					ETag:       part.ETag,
+					PartNumber: part.PartNumber,
+				})
+				if *part.PartNumber > maxPartNum {
+					maxPartNum = *part.PartNumber
+				}
+			}
+		}
+
+		s.uploads[uploadID] = &s3UploadInfo{
+			uploadID:  s3UploadID,
+			key:       key,
+			parts:     completedParts,
+			partNum:   int(maxPartNum) + 1, // Next part number
+			buffer:    new(bytes.Buffer),
+			totalSize: 0, // Unknown when restoring - will be determined during upload
+		}
+
+		log.Printf("S3: [RestoreInProgressUploads] restored uploadID=%s with %d parts, nextPart=%d", uploadID, len(completedParts), maxPartNum+1)
+	}
+
+	log.Printf("S3: [SUCCESS RestoreInProgressUploads] restored %d uploads, mapSize=%d", len(result.Uploads), len(s.uploads))
+	return nil
 }

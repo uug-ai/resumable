@@ -30,7 +30,7 @@ func main() {
 	}
 
 	// Open the file to upload
-	file, err := os.Open("Big_Buck_Bunny_1080_10s_1MB.mp4")
+	file, err := os.Open("falcon-60min.mp4.mp4")
 	if err != nil {
 		log.Fatalf("Failed to open file: %v", err)
 	}

@@ -1,5 +1,6 @@
 .env.local
 .vscode/settings.json
 .DS_Store
-Big_Buck_Bunny_1080_10s_1MB.mp4
+videos/
 uploads/
+__debug*
