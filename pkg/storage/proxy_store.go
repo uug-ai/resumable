@@ -86,30 +86,38 @@ func (ps *ProxyStore) NewUpload(ctx context.Context, info handler.FileInfo) (han
 		log.Printf("ProxyStore: [ERROR NewUpload] local store failed for ID=%q: %v", info.ID, err)
 		return nil, err
 	}
-	log.Printf("ProxyStore: [NewUpload] local upload created for ID=%q", info.ID)
 
-	// Initiate upload on remote storage with retry
-	log.Printf("ProxyStore: [NewUpload] initiating remote upload for ID=%q", info.ID)
+	// Get the actual upload ID from the created upload (local store generates it)
+	uploadInfo, err := upload.GetInfo(ctx)
+	if err != nil {
+		log.Printf("ProxyStore: [ERROR NewUpload] failed to get upload info: %v", err)
+		return nil, err
+	}
+	actualID := uploadInfo.ID
+	log.Printf("ProxyStore: [NewUpload] local upload created with ID=%q", actualID)
+
+	// Initiate upload on remote storage with retry using the actual ID
+	log.Printf("ProxyStore: [NewUpload] initiating remote upload for ID=%q", actualID)
 	err = ps.retryOperation(func() error {
-		return ps.remoteStorage.InitiateUpload(ctx, info.ID, info.Size, info.MetaData)
+		return ps.remoteStorage.InitiateUpload(ctx, actualID, uploadInfo.Size, uploadInfo.MetaData)
 	})
 
 	if err != nil {
-		log.Printf("ProxyStore: [WARNING NewUpload] Failed to initiate remote upload for %q: %v", info.ID, err)
+		log.Printf("ProxyStore: [WARNING NewUpload] Failed to initiate remote upload for %q: %v", actualID, err)
 		// Don't fail the upload, we'll retry on write
 	} else {
-		log.Printf("ProxyStore: [NewUpload] remote upload initiated successfully for ID=%q", info.ID)
+		log.Printf("ProxyStore: [NewUpload] remote upload initiated successfully for ID=%q", actualID)
 	}
 
 	ps.progressLock.Lock()
-	ps.remoteOffsets[info.ID] = 0
+	ps.remoteOffsets[actualID] = 0
 	ps.progressLock.Unlock()
 
-	log.Printf("ProxyStore: [SUCCESS NewUpload] returning proxyUpload with id=%q", info.ID)
+	log.Printf("ProxyStore: [SUCCESS NewUpload] returning proxyUpload with id=%q", actualID)
 	return &proxyUpload{
 		upload:     upload,
 		proxyStore: ps,
-		id:         info.ID,
+		id:         actualID,
 	}, nil
 }
 
