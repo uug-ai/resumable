@@ -50,17 +50,21 @@ type ProxyStore struct {
 
 	// Track pending chunk uploads
 	pendingChunks map[string][]*chunkSync
+
+	// Track uploads currently syncing from local to remote
+	syncInProgress map[string]bool
 }
 
 // NewProxyStore creates a new proxy store that forwards data to remote storage
 func NewProxyStore(localStore handler.DataStore, remoteStorage RemoteStorage) *ProxyStore {
 	return &ProxyStore{
-		localStore:    localStore,
-		remoteStorage: remoteStorage,
-		retryAttempts: 3,
-		retryDelay:    time.Second * 2,
-		remoteOffsets: make(map[string]int64),
-		pendingChunks: make(map[string][]*chunkSync),
+		localStore:     localStore,
+		remoteStorage:  remoteStorage,
+		retryAttempts:  3,
+		retryDelay:     time.Second * 2,
+		remoteOffsets:  make(map[string]int64),
+		pendingChunks:  make(map[string][]*chunkSync),
+		syncInProgress: make(map[string]bool),
 	}
 }
 
@@ -164,12 +168,42 @@ func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload,
 	ps.remoteOffsets[id] = remoteOffset
 	ps.progressLock.Unlock()
 
-	// After a restart, local storage may have more data than remote storage
-	// (e.g., buffered data that wasn't flushed to S3 before the restart)
-	// Sync any missing data from local to remote
-	if info.Offset > remoteOffset {
-		log.Printf("ProxyStore: [GetUpload] local offset (%d) > remote offset (%d), syncing missing data for %q",
-			info.Offset, remoteOffset, id)
+	// After a restart, we need to handle two scenarios:
+	// 1. Local has more data than remote (buffered data not yet flushed to S3)
+	// 2. Remote has more data than local (server restarted, local .info file reset)
+
+	// Check actual local file size, not just info.Offset
+	// The .info file can be reset to Offset=0, but the binary data file still has content
+	var localDataSize int64 = info.Offset
+	reader, err := upload.GetReader(ctx)
+	if err == nil {
+		defer reader.Close()
+		// Try to seek to end to get actual file size
+		if seeker, ok := reader.(io.Seeker); ok {
+			if endPos, err := seeker.Seek(0, io.SeekEnd); err == nil {
+				localDataSize = endPos
+				if localDataSize != info.Offset {
+					log.Printf("ProxyStore: [GetUpload] detected mismatch: info.Offset=%d but actual file size=%d for %q",
+						info.Offset, localDataSize, id)
+				}
+			}
+		}
+	}
+
+	// Case 1: Local has more data than remote - sync missing data TO remote
+	if localDataSize > remoteOffset {
+		log.Printf("ProxyStore: [GetUpload] local data size (%d) > remote offset (%d), syncing missing data TO remote for %q",
+			localDataSize, remoteOffset, id)
+
+		// Mark this upload as syncing to block concurrent writes
+		ps.progressLock.Lock()
+		ps.syncInProgress[id] = true
+		ps.progressLock.Unlock()
+		defer func() {
+			ps.progressLock.Lock()
+			delete(ps.syncInProgress, id)
+			ps.progressLock.Unlock()
+		}()
 
 		// Read the missing chunk from local storage
 		reader, err := upload.GetReader(ctx)
@@ -184,8 +218,8 @@ func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload,
 					log.Printf("ProxyStore: [WARNING GetUpload] failed to seek to offset %d: %v", remoteOffset, err)
 				} else {
 					// Sync the missing chunk
-					missingSize := info.Offset - remoteOffset
-					log.Printf("ProxyStore: [GetUpload] syncing %d bytes from offset %d", missingSize, remoteOffset)
+					missingSize := localDataSize - remoteOffset
+					log.Printf("ProxyStore: [GetUpload] syncing %d bytes from offset %d to %d", missingSize, remoteOffset, localDataSize)
 
 					err := ps.retryOperation(func() error {
 						// Re-open reader for each retry attempt
@@ -206,11 +240,11 @@ func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload,
 					})
 
 					if err != nil {
-						log.Printf("ProxyStore: [WARNING GetUpload] failed to sync missing data: %v", err)
+						log.Printf("ProxyStore: [WARNING GetUpload] failed to sync missing data TO remote: %v", err)
 					} else {
-						log.Printf("ProxyStore: [GetUpload] successfully synced missing data for %q", id)
+						log.Printf("ProxyStore: [GetUpload] successfully synced missing data TO remote for %q", id)
 						ps.progressLock.Lock()
-						ps.remoteOffsets[id] = info.Offset
+						ps.remoteOffsets[id] = localDataSize
 						ps.progressLock.Unlock()
 					}
 				}
@@ -218,7 +252,16 @@ func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload,
 		}
 	}
 
-	log.Printf("ProxyStore: [SUCCESS GetUpload] returning proxyUpload with id=%q", id)
+	// Case 2: Remote ahead of local - this happens after server restart when .info file is reset
+	// We need to tell the client the actual remote offset so it doesn't resend already-uploaded data
+	if remoteOffset > localDataSize {
+		log.Printf("ProxyStore: [GetUpload] remote offset (%d) > local file size (%d) for %q",
+			remoteOffset, localDataSize, id)
+		log.Printf("ProxyStore: [GetUpload] WARNING: Local file data lost. Client should resume from offset %d", remoteOffset)
+	}
+
+	log.Printf("ProxyStore: [SUCCESS GetUpload] returning proxyUpload with id=%q localOffset=%d localFileSize=%d remoteOffset=%d",
+		id, info.Offset, localDataSize, remoteOffset)
 	return &proxyUpload{
 		upload:     upload,
 		proxyStore: ps,
@@ -279,6 +322,54 @@ type proxyUpload struct {
 // WriteChunk writes data to local storage first, then sends to remote storage
 func (pu *proxyUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
 	log.Printf("ProxyUpload: [ENTER WriteChunk] id=%q (len=%d) offset=%d", pu.id, len(pu.id), offset)
+
+	// Wait if a sync operation is in progress (from GetUpload)
+	for {
+		pu.proxyStore.progressLock.RLock()
+		syncing := pu.proxyStore.syncInProgress[pu.id]
+		pu.proxyStore.progressLock.RUnlock()
+		if !syncing {
+			break
+		}
+		log.Printf("ProxyUpload: [WriteChunk] waiting for sync to complete for id=%q", pu.id)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Validate offset against remote progress to prevent gaps after server restart
+	pu.proxyStore.progressLock.RLock()
+	remoteOffset := pu.proxyStore.remoteOffsets[pu.id]
+	pu.proxyStore.progressLock.RUnlock()
+
+	// The offset must match either:
+	// 1. Local offset (normal case), or
+	// 2. Remote offset (after restart when local is behind)
+	// We can't accept writes that would create gaps
+	localInfo, err := pu.upload.GetInfo(ctx)
+	if err != nil {
+		log.Printf("ProxyUpload: [ERROR WriteChunk] failed to get upload info: %v", err)
+		return 0, err
+	}
+
+	expectedOffset := localInfo.Offset
+	if remoteOffset > expectedOffset {
+		expectedOffset = remoteOffset
+	}
+
+	if offset != expectedOffset {
+		log.Printf("ProxyUpload: [ERROR WriteChunk] offset mismatch for id=%q: expected=%d got=%d (local=%d remote=%d)",
+			pu.id, expectedOffset, offset, localInfo.Offset, remoteOffset)
+		return 0, fmt.Errorf("offset mismatch: expected %d, got %d", expectedOffset, offset)
+	}
+
+	// Special case: if remote is ahead of local (after restart), we need to skip local write
+	// because the data is already in S3, and writing it to local at the wrong offset creates corruption
+	if remoteOffset > localInfo.Offset && offset >= localInfo.Offset && offset < remoteOffset {
+		log.Printf("ProxyUpload: [WriteChunk] skipping redundant write for id=%q at offset=%d (already in S3, remote=%d, local=%d)",
+			pu.id, offset, remoteOffset, localInfo.Offset)
+		// Read and discard the data
+		n, err := io.Copy(io.Discard, src)
+		return n, err
+	}
 
 	// Step 1: Write to local storage first to ensure data is persisted
 	bytesWritten, localErr := pu.upload.WriteChunk(ctx, offset, src)
@@ -425,7 +516,27 @@ func (pu *proxyUpload) FinishUpload(ctx context.Context) error {
 
 // GetInfo returns upload information
 func (pu *proxyUpload) GetInfo(ctx context.Context) (handler.FileInfo, error) {
-	return pu.upload.GetInfo(ctx)
+	info, err := pu.upload.GetInfo(ctx)
+	if err != nil {
+		return info, err
+	}
+
+	// After a server restart, the local .info file may show Offset=0
+	// but the remote storage may have partial data already uploaded
+	// We need to return the maximum offset to the client
+	pu.proxyStore.progressLock.RLock()
+	remoteOffset := pu.proxyStore.remoteOffsets[pu.id]
+	pu.proxyStore.progressLock.RUnlock()
+
+	// Use the maximum of local and remote offsets
+	// This ensures the client knows the true upload progress after a restart
+	if remoteOffset > info.Offset {
+		log.Printf("ProxyUpload: [GetInfo] adjusting offset for %q from local=%d to remote=%d",
+			pu.id, info.Offset, remoteOffset)
+		info.Offset = remoteOffset
+	}
+
+	return info, nil
 }
 
 // GetReader returns a reader for the upload data
