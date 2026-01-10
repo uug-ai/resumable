@@ -42,6 +42,10 @@ jobs:
           # Wait for MinIO to be ready
           timeout 30 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done'
           echo "MinIO is ready"
+
+          # Create test bucket
+          docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/test-bucket --ignore-existing"
+          echo "Test bucket created"
           
       # Setup Golang for us in the workflow
       - uses: actions/setup-go@v5
