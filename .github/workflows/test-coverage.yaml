@@ -24,10 +24,6 @@ jobs:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - name: Checkout repository
-        uses: actions/checkout@v2
-      
       # Start MinIO server
       - name: Start MinIO
         run: |
@@ -47,6 +43,9 @@ jobs:
           docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/test-bucket --ignore-existing"
           echo "Test bucket created"
           
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
+        uses: actions/checkout@v3
       # Setup Golang for us in the workflow
       - uses: actions/setup-go@v5
         with:
