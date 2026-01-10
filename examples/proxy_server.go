@@ -30,7 +30,7 @@ func main() {
 	// Choose one of the following options:
 
 	// Option A: Mock storage (for testing without S3)
-	remoteStorage := storage.NewS3RemoteStorage(
+	remoteStorage := storage.NewS3MockStorage(
 		"my-bucket",
 		"us-east-1",
 		"",

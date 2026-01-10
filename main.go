@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
@@ -18,13 +19,27 @@ func main() {
 
 	// Create remote storage backend (S3, Azure, GCS, etc.)
 	// This is where files will ultimately be stored
-	remoteStorage := storage.NewS3RemoteStorage(
-		"my-bucket",             // bucket name
-		"us-east-1",             // region
-		"http://localhost:9000", // endpoint (for MinIO/localstack)
-		"access-key",            // access key
-		"secret-key",            // secret key
+	// Load configuration from environment variables
+	bucket := os.Getenv("AWS_S3_BUCKET")
+	region := os.Getenv("AWS_S3_REGION")
+	endpoint := os.Getenv("AWS_S3_ENDPOINT")
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+
+	if bucket == "" || accessKey == "" {
+		log.Fatal("AWS_S3_BUCKET and AWS_ACCESS_KEY_ID environment variables are required")
+	}
+
+	remoteStorage, err := storage.NewS3Storage(
+		bucket,
+		region,
+		endpoint,
+		accessKey,
+		secretKey,
 	)
+	if err != nil {
+		log.Fatalf("Failed to initialize S3 remote storage: %v", err)
+	}
 
 	// Create ProxyStore that streams to remote storage while receiving
 	proxyStore := storage.NewProxyStore(localStore, remoteStorage)

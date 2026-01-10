@@ -1,4 +1,9 @@
 {
+    "go.testEnvFile": "${workspaceFolder}/.env.local",
+    "go.testEnvVars": {},
+    "go.toolsEnvVars": {
+        "DOTENV_PATH": "${workspaceFolder}/.env.local"
+    },
     "mdb.presetConnections": [
         {
             "name": "MongoDB Atlas Production",
@@ -6,5 +11,5 @@
         }
     ],
     "git.autofetch": true,
-    "git.enableSmartCommit": true,
+    "git.enableSmartCommit": true
 }

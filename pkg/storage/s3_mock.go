@@ -7,10 +7,10 @@ import (
 	"log"
 )
 
-// S3RemoteStorage implements RemoteStorage interface for AWS S3
+// S3MockStorage implements RemoteStorage interface for AWS S3
 // This is a mock implementation showing the interface structure
 // In production, you'd use the AWS SDK
-type S3RemoteStorage struct {
+type S3MockStorage struct {
 	bucket    string
 	region    string
 	endpoint  string
@@ -18,8 +18,8 @@ type S3RemoteStorage struct {
 	secretKey string
 }
 
-func NewS3RemoteStorage(bucket, region, endpoint, accessKey, secretKey string) *S3RemoteStorage {
-	return &S3RemoteStorage{
+func NewS3MockStorage(bucket, region, endpoint, accessKey, secretKey string) *S3MockStorage {
+	return &S3MockStorage{
 		bucket:    bucket,
 		region:    region,
 		endpoint:  endpoint,
@@ -28,7 +28,7 @@ func NewS3RemoteStorage(bucket, region, endpoint, accessKey, secretKey string) *
 	}
 }
 
-func (s *S3RemoteStorage) InitiateUpload(ctx context.Context, uploadID string, size int64, metadata map[string]string) error {
+func (s *S3MockStorage) InitiateUpload(ctx context.Context, uploadID string, size int64, metadata map[string]string) error {
 	log.Printf("S3: Initiating multipart upload for %s (size: %d)", uploadID, size)
 
 	// In real implementation:
@@ -44,7 +44,7 @@ func (s *S3RemoteStorage) InitiateUpload(ctx context.Context, uploadID string, s
 	return nil
 }
 
-func (s *S3RemoteStorage) WriteChunk(ctx context.Context, uploadID string, offset int64, data io.Reader, size int64) error {
+func (s *S3MockStorage) WriteChunk(ctx context.Context, uploadID string, offset int64, data io.Reader, size int64) error {
 	log.Printf("S3: Writing chunk for %s at offset %d", uploadID, offset)
 
 	// In real implementation:
@@ -71,7 +71,7 @@ func (s *S3RemoteStorage) WriteChunk(ctx context.Context, uploadID string, offse
 	return nil
 }
 
-func (s *S3RemoteStorage) FinalizeUpload(ctx context.Context, uploadID string) error {
+func (s *S3MockStorage) FinalizeUpload(ctx context.Context, uploadID string) error {
 	log.Printf("S3: Finalizing upload for %s", uploadID)
 
 	// In real implementation:
@@ -89,7 +89,7 @@ func (s *S3RemoteStorage) FinalizeUpload(ctx context.Context, uploadID string) e
 	return nil
 }
 
-func (s *S3RemoteStorage) AbortUpload(ctx context.Context, uploadID string) error {
+func (s *S3MockStorage) AbortUpload(ctx context.Context, uploadID string) error {
 	log.Printf("S3: Aborting upload for %s", uploadID)
 
 	// In real implementation:
@@ -104,7 +104,7 @@ func (s *S3RemoteStorage) AbortUpload(ctx context.Context, uploadID string) erro
 	return nil
 }
 
-func (s *S3RemoteStorage) GetUploadProgress(ctx context.Context, uploadID string) (int64, error) {
+func (s *S3MockStorage) GetUploadProgress(ctx context.Context, uploadID string) (int64, error) {
 	log.Printf("S3: Getting upload progress for %s", uploadID)
 
 	// In real implementation:
