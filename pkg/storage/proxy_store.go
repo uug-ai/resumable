@@ -164,6 +164,60 @@ func (ps *ProxyStore) GetUpload(ctx context.Context, id string) (handler.Upload,
 	ps.remoteOffsets[id] = remoteOffset
 	ps.progressLock.Unlock()
 
+	// After a restart, local storage may have more data than remote storage
+	// (e.g., buffered data that wasn't flushed to S3 before the restart)
+	// Sync any missing data from local to remote
+	if info.Offset > remoteOffset {
+		log.Printf("ProxyStore: [GetUpload] local offset (%d) > remote offset (%d), syncing missing data for %q",
+			info.Offset, remoteOffset, id)
+
+		// Read the missing chunk from local storage
+		reader, err := upload.GetReader(ctx)
+		if err != nil {
+			log.Printf("ProxyStore: [WARNING GetUpload] failed to get reader for syncing: %v", err)
+		} else {
+			defer reader.Close()
+
+			// Seek to the remote offset
+			if seeker, ok := reader.(io.Seeker); ok {
+				if _, err := seeker.Seek(remoteOffset, io.SeekStart); err != nil {
+					log.Printf("ProxyStore: [WARNING GetUpload] failed to seek to offset %d: %v", remoteOffset, err)
+				} else {
+					// Sync the missing chunk
+					missingSize := info.Offset - remoteOffset
+					log.Printf("ProxyStore: [GetUpload] syncing %d bytes from offset %d", missingSize, remoteOffset)
+
+					err := ps.retryOperation(func() error {
+						// Re-open reader for each retry attempt
+						retryReader, err := upload.GetReader(ctx)
+						if err != nil {
+							return fmt.Errorf("failed to get reader: %w", err)
+						}
+						defer retryReader.Close()
+
+						if seeker, ok := retryReader.(io.Seeker); ok {
+							if _, err := seeker.Seek(remoteOffset, io.SeekStart); err != nil {
+								return fmt.Errorf("failed to seek to offset %d: %w", remoteOffset, err)
+							}
+						}
+
+						limitedReader := io.LimitReader(retryReader, missingSize)
+						return ps.remoteStorage.WriteChunk(ctx, id, remoteOffset, limitedReader, missingSize)
+					})
+
+					if err != nil {
+						log.Printf("ProxyStore: [WARNING GetUpload] failed to sync missing data: %v", err)
+					} else {
+						log.Printf("ProxyStore: [GetUpload] successfully synced missing data for %q", id)
+						ps.progressLock.Lock()
+						ps.remoteOffsets[id] = info.Offset
+						ps.progressLock.Unlock()
+					}
+				}
+			}
+		}
+	}
+
 	log.Printf("ProxyStore: [SUCCESS GetUpload] returning proxyUpload with id=%q", id)
 	return &proxyUpload{
 		upload:     upload,

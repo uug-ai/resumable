@@ -430,6 +430,15 @@ func (s *S3Storage) GetUploadProgress(ctx context.Context, uploadID string) (int
 	}
 	log.Printf("S3: [GetUploadProgress] uploadID=%s calculated totalSize=%d from %d parts", uploadID, totalSize, len(result.Parts))
 
+	// Add any buffered data that hasn't been uploaded yet
+	s.uploadsLock.RLock()
+	if info, exists := s.uploads[uploadID]; exists && info.buffer.Len() > 0 {
+		bufferSize := int64(info.buffer.Len())
+		totalSize += bufferSize
+		log.Printf("S3: [GetUploadProgress] uploadID=%s adding %d buffered bytes, totalSize=%d", uploadID, bufferSize, totalSize)
+	}
+	s.uploadsLock.RUnlock()
+
 	log.Printf("S3: [SUCCESS GetUploadProgress] uploadID=%s totalSize=%d", uploadID, totalSize)
 	return totalSize, nil
 }

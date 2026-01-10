@@ -17,6 +17,7 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
+            "cwd": "${workspaceFolder}/cmd",
             "program": "${workspaceFolder}/cmd/client_upload.go",
             "envFile": "${workspaceFolder}/.env.local"
         }
